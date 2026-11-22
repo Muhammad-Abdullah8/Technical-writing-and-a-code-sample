@@ -1,0 +1,519 @@
+"""
+Kundur two-area: Bus 7 versus Bus 9 false-load-measurement sensitivity graphs.
+
+Research reproduction script. Original equations and parameter settings are retained.
+See README.md for methodological cautions and setup.
+"""
+
+# ============================================================
+# READY-TO-RUN
+# Kundur Two-Area System - FDI GRAPH-ONLY BUS CRITICALITY
+#
+# PURPOSE:
+#   Compare Bus 7 and Bus 9 under false load injection and
+#   visualize which bus is more critical.
+#
+# WHAT THIS CODE DOES:
+#   1) Builds the Kundur two-area network
+#   2) Uses G3 as ext_grid for robust OPF convergence
+#   3) Applies false load injection at Bus 7 or Bus 9
+#   4) Runs EMS OPF on falsified measurements
+#   5) Applies EMS dispatch to the true physical network
+#   6) Runs AC power flow on the true network
+#   7) Plots:
+#        - Injection vs Tie-Line Stress
+#        - Injection vs Minimum Voltage
+#        - Injection vs Dispatch Deviation
+#        - Injection vs Max Line Loading
+#
+# INTERPRETATION:
+#   - More critical bus -> higher tie-line stress
+#   - More critical bus -> larger dispatch deviation
+#   - More critical bus -> higher line loading
+#   - More critical bus -> lower minimum voltage
+#
+# REQUIREMENTS:
+#   pip install pandapower numpy pandas matplotlib
+#
+# RUN:
+#   python kundur_fdi_graph_only.py
+# ============================================================
+
+import copy
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pandapower as pp
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+SBASE = 100.0
+VN_KV = 230.0
+F_HZ = 50.0
+GEN_CP1 = 30.0
+BIG_PEN = 1e6
+VMIN_COLLAPSE = 0.75
+
+# Smooth attack sweep for graph
+FDI_LEVELS = np.arange(0.0, 525.0, 25.0)   # 0, 25, ..., 500 MW
+
+ATTACK_BUSES = {
+    7: "Area 1",
+    9: "Area 2"
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def pu_to_ohm(pu, vn_kv=VN_KV, sbase_mva=SBASE):
+    zbase_ohm = (vn_kv ** 2) / sbase_mva
+    return pu * zbase_ohm
+
+
+def b_pu_to_c_nf_per_km(b_pu, vn_kv=VN_KV, sbase_mva=SBASE, f_hz=F_HZ, length_km=1.0):
+    zbase = (vn_kv ** 2) / sbase_mva
+    b_si = b_pu / zbase
+    c_total = b_si / (2 * np.pi * f_hz)
+    return (c_total / length_km) * 1e9
+
+
+def safe_legend():
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if len(labels) > 0:
+        plt.legend()
+
+
+# ============================================================
+# 1) BUILD KUNDUR NETWORK FOR FDI
+#    G3 is modeled as ext_grid for robust OPF
+# ============================================================
+def build_kundur_net_fdi():
+    net = pp.create_empty_network(sn_mva=SBASE, f_hz=F_HZ)
+
+    # Buses 1..11
+    bus = {}
+    for b in range(1, 12):
+        bus[b] = pp.create_bus(net, vn_kv=VN_KV, name=f"Bus {b}")
+
+    net.bus["min_vm_pu"] = 0.90
+    net.bus["max_vm_pu"] = 1.10
+
+    # Transformers
+    x_tr_100 = 0.15 * (SBASE / 900.0)
+    r_tr_100 = 0.0
+    z_tr = np.sqrt(r_tr_100 ** 2 + x_tr_100 ** 2)
+    vk_percent = z_tr * 100.0
+    vkr_percent = r_tr_100 * 100.0
+
+    for (hv, lv) in [(1, 5), (2, 6), (3, 11), (4, 10)]:
+        pp.create_transformer_from_parameters(
+            net,
+            hv_bus=bus[hv],
+            lv_bus=bus[lv],
+            sn_mva=900.0,
+            vn_hv_kv=VN_KV,
+            vn_lv_kv=VN_KV,
+            vk_percent=vk_percent,
+            vkr_percent=vkr_percent,
+            pfe_kw=0.0,
+            i0_percent=0.0,
+            shift_degree=0.0,
+            name=f"TR {hv}-{lv}",
+        )
+
+    # Lines
+    line_specs = [
+        (5, 6, 0.0025, 0.025, 0.04375, 1),
+        (6, 7, 0.0010, 0.010, 0.01750, 1),
+        (7, 8, 0.0110, 0.110, 0.19250, 2),
+        (8, 9, 0.0110, 0.110, 0.19250, 2),
+        (9, 10, 0.0010, 0.010, 0.01750, 1),
+        (10, 11, 0.0025, 0.025, 0.04375, 1),
+    ]
+
+    corridor_line_ids = []
+
+    for (fb, tb, rpu, xpu, bpu, npar) in line_specs:
+        for k in range(npar):
+            lid = pp.create_line_from_parameters(
+                net,
+                from_bus=bus[fb],
+                to_bus=bus[tb],
+                length_km=1.0,
+                r_ohm_per_km=pu_to_ohm(rpu),
+                x_ohm_per_km=pu_to_ohm(xpu),
+                c_nf_per_km=b_pu_to_c_nf_per_km(bpu),
+                max_i_ka=3.0,
+                name=f"Line {fb}-{tb} #{k+1}",
+            )
+            if (fb, tb) in [(7, 8), (8, 9)]:
+                corridor_line_ids.append(lid)
+
+    # Loads
+    pp.create_load(net, bus=bus[7], p_mw=967.0, q_mvar=100.0, name="Load7")
+    pp.create_load(net, bus=bus[9], p_mw=1767.0, q_mvar=100.0, name="Load9")
+
+    # Shunts
+    pp.create_shunt(net, bus=bus[7], p_mw=0.0, q_mvar=-200.0, name="QSH7")
+    pp.create_shunt(net, bus=bus[9], p_mw=0.0, q_mvar=-350.0, name="QSH9")
+
+    # Reference machine as ext_grid
+    eg = pp.create_ext_grid(net, bus=bus[3], vm_pu=1.03, name="G3_ref")
+    net.ext_grid.loc[eg, ["min_p_mw", "max_p_mw", "min_q_mvar", "max_q_mvar"]] = [
+        -3000.0, 3000.0, -2000.0, 2000.0
+    ]
+    pp.create_poly_cost(net, element=eg, et="ext_grid", cp1_eur_per_mw=GEN_CP1)
+
+    # Remaining generators
+    gen_specs = [
+        (1, "G1", 1.03, 700.0),
+        (2, "G2", 1.01, 700.0),
+        (4, "G4", 1.01, 700.0),
+    ]
+
+    for (b, name, vm, p0) in gen_specs:
+        gid = pp.create_gen(net, bus=bus[b], p_mw=p0, vm_pu=vm, name=name, controllable=True)
+        net.gen.loc[gid, ["min_p_mw", "max_p_mw", "min_q_mvar", "max_q_mvar"]] = [
+            0.0, 3000.0, -2000.0, 2000.0
+        ]
+        pp.create_poly_cost(net, element=gid, et="gen", cp1_eur_per_mw=GEN_CP1)
+
+    if "max_loading_percent" not in net.line.columns:
+        net.line["max_loading_percent"] = 100.0
+    net.line["max_loading_percent"] = net.line["max_loading_percent"].fillna(100.0)
+
+    return net, corridor_line_ids
+
+
+# ============================================================
+# 2) OPF/PF HELPERS
+# ============================================================
+def prepare_fixed_load_opf(net):
+    net.load["controllable"] = False
+
+
+def compute_dispatch_cost(net):
+    cost = 0.0
+    if len(net.gen):
+        cost += float(net.res_gen["p_mw"].clip(lower=0.0).sum()) * GEN_CP1
+    if len(net.ext_grid):
+        cost += float(net.res_ext_grid["p_mw"].clip(lower=0.0).sum()) * GEN_CP1
+    return cost
+
+
+def run_opf_fixed_loads(net, corridor_line_ids):
+    try:
+        pp.runopp(net, calculate_voltage_angles=True, suppress_warnings=True)
+    except Exception:
+        return {
+            "opf_ok": False,
+            "ems_cost": BIG_PEN,
+            "VV": BIG_PEN,
+            "OL": BIG_PEN,
+            "TF": BIG_PEN,
+            "vmin": 0.0,
+            "max_loading": BIG_PEN,
+            "collapsed_proxy": True,
+        }
+
+    v = net.res_bus["vm_pu"].values
+    vmin = float(np.min(v))
+    vlims_min = net.bus["min_vm_pu"].values
+    vlims_max = net.bus["max_vm_pu"].values
+    VV = float(np.maximum(0.0, vlims_min - v).sum() + np.maximum(0.0, v - vlims_max).sum())
+
+    loading = net.res_line["loading_percent"].values if len(net.line) else np.array([0.0])
+    max_loading = float(np.max(loading)) if len(loading) else 0.0
+    lim = net.line["max_loading_percent"].values
+    OL = float(np.maximum(0.0, loading - lim).sum()) if len(net.line) else 0.0
+
+    TF = float(net.res_line.loc[corridor_line_ids, "p_from_mw"].abs().sum()) if corridor_line_ids else 0.0
+    collapsed_proxy = (vmin < VMIN_COLLAPSE)
+
+    return {
+        "opf_ok": True,
+        "ems_cost": float(compute_dispatch_cost(net)),
+        "VV": float(VV),
+        "OL": float(OL),
+        "TF": float(TF),
+        "vmin": vmin,
+        "max_loading": max_loading,
+        "collapsed_proxy": collapsed_proxy,
+    }
+
+
+def run_pf_truth_metrics(net, corridor_line_ids):
+    try:
+        pp.runpp(net, calculate_voltage_angles=True, init="flat")
+    except Exception:
+        return {
+            "pf_ok": False,
+            "mismatch_mw": BIG_PEN,
+            "VV": BIG_PEN,
+            "OL": BIG_PEN,
+            "TF": BIG_PEN,
+            "vmin": 0.0,
+            "max_loading": BIG_PEN,
+            "collapsed_proxy": True,
+        }
+
+    total_gen = 0.0
+    if len(net.gen):
+        total_gen += float(net.res_gen["p_mw"].sum())
+    if len(net.ext_grid):
+        total_gen += float(net.res_ext_grid["p_mw"].sum())
+
+    total_load = float(net.res_load["p_mw"].sum()) if len(net.load) else 0.0
+    mismatch_mw = abs(total_gen - total_load)
+
+    v = net.res_bus["vm_pu"].values
+    vmin = float(np.min(v))
+    vlims_min = net.bus["min_vm_pu"].values
+    vlims_max = net.bus["max_vm_pu"].values
+    VV = float(np.maximum(0.0, vlims_min - v).sum() + np.maximum(0.0, v - vlims_max).sum())
+
+    loading = net.res_line["loading_percent"].values if len(net.line) else np.array([0.0])
+    max_loading = float(np.max(loading)) if len(loading) else 0.0
+    lim = net.line["max_loading_percent"].values
+    OL = float(np.maximum(0.0, loading - lim).sum()) if len(net.line) else 0.0
+
+    TF = float(net.res_line.loc[corridor_line_ids, "p_from_mw"].abs().sum()) if corridor_line_ids else 0.0
+    collapsed_proxy = (vmin < VMIN_COLLAPSE)
+
+    return {
+        "pf_ok": True,
+        "mismatch_mw": float(mismatch_mw),
+        "VV": float(VV),
+        "OL": float(OL),
+        "TF": float(TF),
+        "vmin": vmin,
+        "max_loading": max_loading,
+        "collapsed_proxy": collapsed_proxy,
+    }
+
+
+# ============================================================
+# 3) FDI HELPERS
+# ============================================================
+def get_load_index_by_bus(net, bus_number):
+    pp_bus_idx = bus_number - 1
+    candidates = net.load.index[net.load["bus"] == pp_bus_idx].tolist()
+    if len(candidates) == 0:
+        raise ValueError(f"No load found at bus {bus_number}")
+    return candidates[0]
+
+
+def apply_fdi_load_shift(net, attacked_bus_number, delta_p_mw, maintain_pf=True):
+    ld = get_load_index_by_bus(net, attacked_bus_number)
+
+    p0 = float(net.load.at[ld, "p_mw"])
+    q0 = float(net.load.at[ld, "q_mvar"])
+
+    net.load.at[ld, "p_mw"] = p0 + delta_p_mw
+
+    if maintain_pf and abs(p0) > 1e-9:
+        net.load.at[ld, "q_mvar"] = q0 * (p0 + delta_p_mw) / p0
+
+    return ld
+
+
+def apply_ems_dispatch_to_truth_net(net_truth, net_ems):
+    for gid in net_truth.gen.index:
+        net_truth.gen.at[gid, "p_mw"] = float(net_ems.res_gen.at[gid, "p_mw"])
+        net_truth.gen.at[gid, "vm_pu"] = float(net_ems.gen.at[gid, "vm_pu"])
+
+    for eg in net_truth.ext_grid.index:
+        net_truth.ext_grid.at[eg, "vm_pu"] = float(net_ems.ext_grid.at[eg, "vm_pu"])
+
+
+def get_dispatch_vector_from_results(net):
+    vals = []
+    if len(net.gen):
+        vals.extend(list(net.res_gen["p_mw"].values))
+    if len(net.ext_grid):
+        vals.extend(list(net.res_ext_grid["p_mw"].values))
+    return np.array(vals, dtype=float)
+
+
+def get_base_dispatch_vector(net):
+    vals = []
+    if len(net.gen):
+        vals.extend(list(net.gen["p_mw"].values))
+    if len(net.ext_grid):
+        vals.extend([0.0] * len(net.ext_grid))
+    return np.array(vals, dtype=float)
+
+
+# ============================================================
+# 4) RUN ONE FDI CASE
+# ============================================================
+def run_fdi_case(net_base, corridor_line_ids, attacked_bus_number, delta_p_mw):
+    net_ems = copy.deepcopy(net_base)
+    prepare_fixed_load_opf(net_ems)
+    apply_fdi_load_shift(net_ems, attacked_bus_number, delta_p_mw, maintain_pf=True)
+
+    ems_metrics = run_opf_fixed_loads(net_ems, corridor_line_ids)
+    if not ems_metrics["opf_ok"]:
+        return {
+            "bus": attacked_bus_number,
+            "area": ATTACK_BUSES.get(attacked_bus_number, "Unknown"),
+            "delta_p_mw": delta_p_mw,
+            "ems_cost": BIG_PEN,
+            "dispatch_dev": BIG_PEN,
+            "mismatch_mw": BIG_PEN,
+            "VV": BIG_PEN,
+            "OL": BIG_PEN,
+            "TF": BIG_PEN,
+            "opf_ok": False,
+            "pf_ok": False,
+            "vmin": 0.0,
+            "max_loading": BIG_PEN,
+            "collapsed_proxy": True,
+        }
+
+    net_truth = copy.deepcopy(net_base)
+    apply_ems_dispatch_to_truth_net(net_truth, net_ems)
+    truth_metrics = run_pf_truth_metrics(net_truth, corridor_line_ids)
+
+    base_dispatch = get_base_dispatch_vector(net_base)
+    ems_dispatch = get_dispatch_vector_from_results(net_ems)
+    n = min(len(base_dispatch), len(ems_dispatch))
+    dispatch_dev = float(np.abs(ems_dispatch[:n] - base_dispatch[:n]).sum())
+
+    return {
+        "bus": attacked_bus_number,
+        "area": ATTACK_BUSES.get(attacked_bus_number, "Unknown"),
+        "delta_p_mw": delta_p_mw,
+        "ems_cost": ems_metrics["ems_cost"],
+        "dispatch_dev": dispatch_dev,
+        "mismatch_mw": truth_metrics["mismatch_mw"],
+        "VV": truth_metrics["VV"],
+        "OL": truth_metrics["OL"],
+        "TF": truth_metrics["TF"],
+        "opf_ok": True,
+        "pf_ok": truth_metrics["pf_ok"],
+        "vmin": truth_metrics["vmin"],
+        "max_loading": truth_metrics["max_loading"],
+        "collapsed_proxy": truth_metrics["collapsed_proxy"],
+    }
+
+
+# ============================================================
+# 5) SWEEP ATTACK LEVELS FOR GRAPH
+# ============================================================
+def run_fdi_sweep(net_base, corridor_line_ids, fdi_levels):
+    rows = []
+    for attacked_bus in ATTACK_BUSES.keys():
+        for dP in fdi_levels:
+            rows.append(run_fdi_case(net_base, corridor_line_ids, attacked_bus, dP))
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 6) CRITICALITY SCORE FROM GRAPH AREA
+# ============================================================
+def compute_graph_scores(detail_df):
+    rows = []
+
+    for bus in sorted(detail_df["bus"].unique()):
+        dfb = detail_df[detail_df["bus"] == bus].sort_values("delta_p_mw")
+
+        x = dfb["delta_p_mw"].values
+        score_tf = np.trapz(dfb["TF"].values, x)
+        score_dd = np.trapz(dfb["dispatch_dev"].values, x)
+        score_ml = np.trapz(dfb["max_loading"].values, x)
+        score_vdrop = np.trapz(1.1 - dfb["vmin"].values, x)   # larger drop => worse
+
+        rows.append({
+            "bus": int(bus),
+            "area": dfb["area"].iloc[0],
+            "score_tieline": float(score_tf),
+            "score_dispatch_dev": float(score_dd),
+            "score_max_loading": float(score_ml),
+            "score_voltage_drop": float(score_vdrop),
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["score_tieline", "score_dispatch_dev", "score_max_loading", "score_voltage_drop"],
+        ascending=False
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# 7) PLOTS
+# ============================================================
+def plot_fdi_graphs(detail_df):
+    styles = {
+        7: {"marker": "o", "linestyle": "-", "label": "Bus 7 (Area 1)"},
+        9: {"marker": "s", "linestyle": "--", "label": "Bus 9 (Area 2)"},
+    }
+
+    plot_specs = [
+        ("TF", "Tie-Line Stress (MW)", "False Load Injection vs Tie-Line Stress"),
+        ("vmin", "Minimum Voltage (pu)", "False Load Injection vs Minimum Voltage"),
+        ("dispatch_dev", "Dispatch Deviation (MW)", "False Load Injection vs Dispatch Deviation"),
+        ("max_loading", "Maximum Line Loading (%)", "False Load Injection vs Maximum Line Loading"),
+    ]
+
+    for ycol, ylabel, title in plot_specs:
+        plt.figure()
+        for bus in sorted(detail_df["bus"].unique()):
+            dfb = detail_df[detail_df["bus"] == bus].sort_values("delta_p_mw")
+            plt.plot(
+                dfb["delta_p_mw"],
+                dfb[ycol],
+                marker=styles[bus]["marker"],
+                linestyle=styles[bus]["linestyle"],
+                linewidth=2.0,
+                markersize=6,
+                label=styles[bus]["label"],
+            )
+        plt.xlabel("False Load Injection (MW)")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(True)
+        safe_legend()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", 50)
+
+    net, corridor = build_kundur_net_fdi()
+    print("Tie-line corridor line IDs:", corridor)
+
+    # Base OPF sanity check
+    net0 = copy.deepcopy(net)
+    prepare_fixed_load_opf(net0)
+    base_check = run_opf_fixed_loads(net0, corridor)
+    print("\nBase EMS OPF check:")
+    print(base_check)
+
+    detail_df = run_fdi_sweep(net, corridor, FDI_LEVELS)
+
+    print("\n=== FDI GRAPH DATA ===")
+    print(detail_df[
+        ["bus", "area", "delta_p_mw", "ems_cost", "dispatch_dev", "mismatch_mw",
+         "VV", "OL", "TF", "opf_ok", "pf_ok", "vmin", "max_loading", "collapsed_proxy"]
+    ].to_string(index=False))
+
+    score_df = compute_graph_scores(detail_df)
+
+    print("\n=== GRAPH-BASED CRITICALITY SCORES ===")
+    print(score_df.to_string(index=False))
+
+    plot_fdi_graphs(detail_df)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

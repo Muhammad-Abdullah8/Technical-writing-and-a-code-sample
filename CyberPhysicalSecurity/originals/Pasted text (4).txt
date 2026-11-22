@@ -1,0 +1,1006 @@
+# # ============================================================
+# # READY-TO-RUN (Single File)
+# # Kundur Two-Area (RTDS tables) + Criticality Ranking
+# # + Case Study II: Malicious Trip Command
+# #
+# # NEW vs previous:
+# # - All 4 machines are modeled as "gen" (G1, G2, G3, G4)
+# # - Slack is assigned dynamically for each scenario:
+# #     if G3 online -> G3 slack, else first online generator becomes slack
+# # - Now you can test tripping ALL FOUR generators (including G3).
+# #
+# # Install:
+# #   pip install pandapower numpy pandas matplotlib
+# #
+# # Run:
+# #   python kundur_trip_case_study_all4.py
+# # ============================================================
+
+# import copy
+# import numpy as np
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# import pandapower as pp
+
+
+# # -----------------------------
+# # USER SETTINGS
+# # -----------------------------
+# SBASE = 100.0     # MVA base for per-unit line tables
+# VN_KV = 230.0     # single voltage level assumption for steady-state
+# F_HZ = 50.0
+
+# VoLL = 1000.0     # €/MW for load shedding penalty in "paper_cost"
+# DEFENDER_PROTECT_TOP_K = 1  # protect top-k critical generators (Case Study II)
+
+# # Criticality weights (not MW-only)
+# W = {"LS": 1.0, "VV": 0.8, "OL": 0.8, "TF": 0.8, "IN": 0.6}
+
+# # Penalty used if OPF fails (keeps CI defined)
+# BIG_PEN = 1e6
+
+# # Voltage collapse proxy threshold (reporting only)
+# VMIN_COLLAPSE = 0.75
+
+# # Generation marginal cost (€/MW) used in paper_cost (keep consistent with poly_cost cp1)
+# GEN_CP1 = 30.0
+
+
+# # -----------------------------
+# # Helpers: per-unit conversions
+# # -----------------------------
+# def pu_to_ohm(pu, vn_kv=VN_KV, sbase_mva=SBASE):
+#     zbase_ohm = (vn_kv ** 2) / sbase_mva
+#     return pu * zbase_ohm
+
+
+# def b_pu_to_c_nf_per_km(b_pu, vn_kv=VN_KV, sbase_mva=SBASE, f_hz=F_HZ, length_km=1.0):
+#     zbase = (vn_kv ** 2) / sbase_mva
+#     b_si = b_pu / zbase
+#     c_total = b_si / (2 * np.pi * f_hz)
+#     return (c_total / length_km) * 1e9
+
+
+# # -----------------------------
+# # 1) Build Kundur network (ALL 4 as gens)
+# # -----------------------------
+# def build_kundur_net_all4gens():
+#     net = pp.create_empty_network(sn_mva=SBASE, f_hz=F_HZ)
+
+#     # Buses 1..11
+#     bus = {}
+#     for b in range(1, 12):
+#         bus[b] = pp.create_bus(net, vn_kv=VN_KV, name=f"Bus {b}")
+
+#     net.bus["min_vm_pu"] = 0.90
+#     net.bus["max_vm_pu"] = 1.10
+
+#     # Transformers: X=0.15 pu on 900 MVA base -> convert to 100 MVA
+#     x_tr_100 = 0.15 * (SBASE / 900.0)  # 0.0166667 pu
+#     r_tr_100 = 0.0
+#     z_tr = np.sqrt(r_tr_100**2 + x_tr_100**2)
+#     vk_percent = z_tr * 100.0
+#     vkr_percent = r_tr_100 * 100.0
+
+#     for (hv, lv) in [(1, 5), (2, 6), (3, 11), (4, 10)]:
+#         pp.create_transformer_from_parameters(
+#             net,
+#             hv_bus=bus[hv],
+#             lv_bus=bus[lv],
+#             sn_mva=900.0,
+#             vn_hv_kv=VN_KV,
+#             vn_lv_kv=VN_KV,
+#             vk_percent=vk_percent,
+#             vkr_percent=vkr_percent,
+#             pfe_kw=0.0,
+#             i0_percent=0.0,
+#             shift_degree=0.0,
+#             name=f"TR {hv}-{lv}",
+#         )
+
+#     # Lines (pu on 100 MVA base)
+#     line_specs = [
+#         (5, 6, 0.0025, 0.025, 0.04375, 1),
+#         (6, 7, 0.0010, 0.010, 0.01750, 1),
+#         (7, 8, 0.0110, 0.110, 0.19250, 2),
+#         (8, 9, 0.0110, 0.110, 0.19250, 2),
+#         (9, 10, 0.0010, 0.010, 0.01750, 1),
+#         (10, 11, 0.0025, 0.025, 0.04375, 1),
+#     ]
+
+#     corridor_line_ids = []  # tie corridor = (7-8) + (8-9) circuits
+
+#     for (fb, tb, rpu, xpu, bpu, npar) in line_specs:
+#         for k in range(npar):
+#             r_ohm = pu_to_ohm(rpu)
+#             x_ohm = pu_to_ohm(xpu)
+#             c_nf_per_km = b_pu_to_c_nf_per_km(bpu)
+
+#             lid = pp.create_line_from_parameters(
+#                 net,
+#                 from_bus=bus[fb],
+#                 to_bus=bus[tb],
+#                 length_km=1.0,
+#                 r_ohm_per_km=r_ohm,
+#                 x_ohm_per_km=x_ohm,
+#                 c_nf_per_km=c_nf_per_km,
+#                 max_i_ka=3.0,  # relaxed to help convergence; tune if you want
+#                 name=f"Line {fb}-{tb} #{k+1}",
+#             )
+
+#             if (fb, tb) in [(7, 8), (8, 9)]:
+#                 corridor_line_ids.append(lid)
+
+#     # Loads
+#     pp.create_load(net, bus=bus[7], p_mw=967.0, q_mvar=100.0, name="Load7")
+#     pp.create_load(net, bus=bus[9], p_mw=1767.0, q_mvar=100.0, name="Load9")
+
+#     # Shunt compensation (capacitive injection => negative q_mvar)
+#     pp.create_shunt(net, bus=bus[7], p_mw=0.0, q_mvar=-200.0, name="QSH7")
+#     pp.create_shunt(net, bus=bus[9], p_mw=0.0, q_mvar=-350.0, name="QSH9")
+
+#     # ---- FOUR generators as net.gen ----
+#     # From your table: V setpoints roughly (1.03, 1.01, 1.03, 1.01)
+#     gen_specs = [
+#         (1, "G1", 1.03, 700.0),
+#         (2, "G2", 1.01, 700.0),
+#         (3, "G3", 1.03, 719.0),  # was slack before, now normal gen
+#         (4, "G4", 1.01, 700.0),
+#     ]
+
+#     for (b, name, vm, p0) in gen_specs:
+#         gid = pp.create_gen(net, bus=bus[b], p_mw=p0, vm_pu=vm, name=name, controllable=True)
+#         # generous limits for feasibility (tune to your exact spec if you have it)
+#         net.gen.loc[gid, ["min_p_mw", "max_p_mw", "min_q_mvar", "max_q_mvar"]] = [0.0, 3000.0, -2000.0, 2000.0]
+
+#     # Slack column (we will set dynamically before each OPF)
+#     if "slack" not in net.gen.columns:
+#         net.gen["slack"] = False
+
+#     # Costs
+#     if len(net.poly_cost) == 0:
+#         for gid in net.gen.index:
+#             pp.create_poly_cost(net, element=gid, et="gen", cp1_eur_per_mw=GEN_CP1)
+
+#     # For overload metric
+#     if "max_loading_percent" not in net.line.columns:
+#         net.line["max_loading_percent"] = 100.0
+#     net.line["max_loading_percent"] = net.line["max_loading_percent"].fillna(100.0)
+
+#     return net, corridor_line_ids
+
+
+# # -----------------------------
+# # 2) Dynamic slack assignment (KEY)
+# # -----------------------------
+# def assign_single_slack_gen(net, preferred_name="G3"):
+#     """
+#     Ensure exactly ONE online generator has slack=True.
+#     Preferred slack is G3 if it is in service; otherwise choose first online gen.
+#     """
+#     # reset all
+#     net.gen["slack"] = False
+
+#     online = net.gen.index[net.gen["in_service"].fillna(True)].tolist()
+#     if len(online) == 0:
+#         raise RuntimeError("No online generators available to be slack.")
+
+#     # try preferred
+#     pref = None
+#     for gid in online:
+#         if str(net.gen.at[gid, "name"]) == preferred_name:
+#             pref = gid
+#             break
+
+#     slack_gid = pref if pref is not None else online[0]
+#     net.gen.at[slack_gid, "slack"] = True
+#     return slack_gid
+
+
+# # -----------------------------
+# # 3) Load shedding in OPF
+# # -----------------------------
+# def enable_load_shedding_opf(net, voll=VoLL):
+#     if "p_nom_mw" not in net.load.columns:
+#         net.load["p_nom_mw"] = net.load["p_mw"].values
+#     if "q_nom_mvar" not in net.load.columns:
+#         net.load["q_nom_mvar"] = net.load["q_mvar"].values
+
+#     net.load["controllable"] = True
+#     net.load["min_p_mw"] = 0.0
+#     net.load["max_p_mw"] = net.load["p_nom_mw"].values
+
+#     net.load["min_q_mvar"] = 0.0
+#     net.load["max_q_mvar"] = net.load["q_nom_mvar"].values
+
+#     existing = set()
+#     if len(net.poly_cost):
+#         existing = set(net.poly_cost.loc[net.poly_cost["et"] == "load", "element"].values)
+#     for ld in net.load.index:
+#         if ld not in existing:
+#             pp.create_poly_cost(net, element=ld, et="load", cp1_eur_per_mw=-voll)
+
+
+# # -----------------------------
+# # 4) Inertia proxy
+# # -----------------------------
+# def get_inertia_data(net):
+#     """
+#     Typical Kundur inertia constants:
+#       G1,G2: 6.5
+#       G3,G4: 6.175
+#     """
+#     S_rated = 900.0
+#     H = {}
+#     S = {}
+#     for gid in net.gen.index:
+#         nm = str(net.gen.at[gid, "name"])
+#         H[gid] = 6.5 if nm in ["G1", "G2"] else 6.175
+#         S[gid] = S_rated
+#     return H, S
+
+
+# def system_inertia(H, S, online_gids):
+#     denom = sum(S[g] for g in online_gids) + 1e-12
+#     num = sum(H[g] * S[g] for g in online_gids)
+#     return num / denom
+
+
+# # -----------------------------
+# # 5) Paper-friendly cost
+# # -----------------------------
+# def compute_paper_cost(net, voll=VoLL):
+#     p_nom = float(net.load["p_nom_mw"].sum()) if len(net.load) else 0.0
+#     p_serv = float(net.res_load["p_mw"].sum()) if len(net.load) else 0.0
+#     shed = max(0.0, p_nom - p_serv)
+
+#     gen_cost = float(net.res_gen["p_mw"].clip(lower=0.0).sum()) * GEN_CP1 if len(net.gen) else 0.0
+#     return gen_cost + voll * shed, shed
+
+
+# # -----------------------------
+# # 6) OPF + metrics
+# # -----------------------------
+# def run_opf_and_metrics(net, corridor_line_ids):
+#     # ensure a single slack gen exists
+#     try:
+#         assign_single_slack_gen(net, preferred_name="G3")
+#     except Exception:
+#         return dict(
+#             opf_ok=False, cost_paper=BIG_PEN, LS=BIG_PEN, VV=BIG_PEN, OL=BIG_PEN, TF=BIG_PEN,
+#             vmin=0.0, max_loading=BIG_PEN, collapsed_proxy=True
+#         )
+
+#     try:
+#         pp.runopp(net, calculate_voltage_angles=True, suppress_warnings=True)
+#         ok = True
+#     except Exception:
+#         return dict(
+#             opf_ok=False, cost_paper=BIG_PEN, LS=BIG_PEN, VV=BIG_PEN, OL=BIG_PEN, TF=BIG_PEN,
+#             vmin=0.0, max_loading=BIG_PEN, collapsed_proxy=True
+#         )
+
+#     cost_paper, shed = compute_paper_cost(net, VoLL)
+
+#     v = net.res_bus["vm_pu"].values
+#     vmin = float(np.min(v))
+#     vlims_min = net.bus["min_vm_pu"].values
+#     vlims_max = net.bus["max_vm_pu"].values
+#     VV = float(np.maximum(0.0, vlims_min - v).sum() + np.maximum(0.0, v - vlims_max).sum())
+
+#     loading = net.res_line["loading_percent"].values if len(net.line) else np.array([0.0])
+#     max_loading = float(np.max(loading)) if len(loading) else 0.0
+#     lim = net.line["max_loading_percent"].values
+#     OL = float(np.maximum(0.0, loading - lim).sum()) if len(net.line) else 0.0
+
+#     TF = float(net.res_line.loc[corridor_line_ids, "p_from_mw"].abs().sum()) if corridor_line_ids else 0.0
+
+#     collapsed_proxy = (vmin < VMIN_COLLAPSE)
+
+#     return dict(
+#         opf_ok=ok,
+#         cost_paper=float(cost_paper),
+#         LS=float(shed),
+#         VV=float(VV),
+#         OL=float(OL),
+#         TF=float(TF),
+#         vmin=vmin,
+#         max_loading=max_loading,
+#         collapsed_proxy=collapsed_proxy,
+#     )
+
+
+# # -----------------------------
+# # 7) Trip + criticality ranking for ALL FOUR gens
+# # -----------------------------
+# def trip_gen(net, gid):
+#     net.gen.at[gid, "in_service"] = False
+
+
+# def compute_criticality_ranking(net_base, corridor_line_ids):
+#     H, S = get_inertia_data(net_base)
+
+#     base_online = net_base.gen.index[net_base.gen["in_service"].fillna(True)].tolist()
+#     Hsys_base = system_inertia(H, S, base_online)
+
+#     rows = []
+#     for gid in net_base.gen.index:
+#         net = copy.deepcopy(net_base)
+#         enable_load_shedding_opf(net, VoLL)
+
+#         # trip this generator
+#         if bool(net.gen.at[gid, "in_service"]):
+#             trip_gen(net, gid)
+
+#         m = run_opf_and_metrics(net, corridor_line_ids)
+
+#         online_minus = net.gen.index[net.gen["in_service"].fillna(True)].tolist()
+#         Hsys_minus = system_inertia(H, S, online_minus) if len(online_minus) else 0.0
+#         IN = float(1.0 / (Hsys_minus + 1e-12))  # higher => worse
+
+#         rows.append({
+#             "gen_id": gid,
+#             "name": str(net_base.gen.at[gid, "name"]),
+#             "cost_paper": m["cost_paper"],
+#             "LS": m["LS"],
+#             "VV": m["VV"],
+#             "OL": m["OL"],
+#             "TF": m["TF"],
+#             "IN": IN,
+#             "opf_ok": m["opf_ok"],
+#             "vmin": m["vmin"],
+#             "max_loading": m["max_loading"],
+#             "collapsed_proxy": m["collapsed_proxy"],
+#             "Hsys_base": Hsys_base,
+#             "Hsys_minus": Hsys_minus,
+#         })
+
+#     df = pd.DataFrame(rows)
+
+#     # Normalize metrics to [0,1] for CI
+#     eps = 1e-9
+#     for col in ["LS", "VV", "OL", "TF", "IN"]:
+#         x = df[col].astype(float).values
+#         xmin, xmax = float(np.min(x)), float(np.max(x))
+#         df[f"n_{col}"] = (df[col] - xmin) / (xmax - xmin + eps)
+
+#     df["CI"] = (
+#         W["LS"] * df["n_LS"] +
+#         W["VV"] * df["n_VV"] +
+#         W["OL"] * df["n_OL"] +
+#         W["TF"] * df["n_TF"] +
+#         W["IN"] * df["n_IN"]
+#     )
+
+#     return df.sort_values("CI", ascending=False).reset_index(drop=True)
+
+
+# # -----------------------------
+# # 8) Case Study II (defender protects top-k; attacker trips most critical unprotected)
+# # -----------------------------
+# def malicious_trip_case_study(net_base, corridor_line_ids, ranking_df, protect_top_k=1):
+#     ordered = ranking_df["gen_id"].tolist()
+#     protected = set(ordered[:protect_top_k])
+
+#     target = None
+#     for gid in ordered:
+#         if gid not in protected:
+#             target = gid
+#             break
+#     if target is None:
+#         raise RuntimeError("All generators protected; attacker has no target.")
+
+#     net_attack = copy.deepcopy(net_base)
+#     enable_load_shedding_opf(net_attack, VoLL)
+#     trip_gen(net_attack, target)
+#     metrics = run_opf_and_metrics(net_attack, corridor_line_ids)
+
+#     return protected, target, metrics
+
+
+# # -----------------------------
+# # 9) Plots
+# # -----------------------------
+# def plot_results(ranking_df):
+#     plt.figure()
+#     plt.bar(ranking_df["name"], ranking_df["CI"])
+#     plt.xlabel("Generator (tripped in N-1)")
+#     plt.ylabel("Criticality Index (CI)")
+#     plt.title("Generator Criticality Ranking (All 4 Trips, Dynamic Slack)")
+#     plt.grid(True, axis="y")
+
+#     plt.figure()
+#     plt.bar(ranking_df["name"], ranking_df["cost_paper"])
+#     plt.xlabel("Generator (tripped in N-1)")
+#     plt.ylabel("OPF Paper Cost = GenCost + VoLL·Shed")
+#     plt.title("OPF Cost Under N-1 Generator Trip (All 4)")
+#     plt.grid(True, axis="y")
+
+#     plt.figure()
+#     x = np.arange(len(ranking_df))
+#     plt.plot(x, ranking_df["LS"], marker="o", label="LS (MW)")
+#     plt.plot(x, ranking_df["VV"], marker="o", label="VV")
+#     plt.plot(x, ranking_df["OL"], marker="o", label="OL")
+#     plt.plot(x, ranking_df["TF"], marker="o", label="TF (MW)")
+#     plt.plot(x, ranking_df["IN"], marker="o", label="IN (1/H)")
+#     plt.xticks(x, ranking_df["name"])
+#     plt.xlabel("Generator (sorted by CI)")
+#     plt.title("Impact Metrics Under N-1 Trip (Sorted by CI)")
+#     plt.grid(True)
+#     plt.legend()
+
+
+# # -----------------------------
+# # MAIN
+# # -----------------------------
+# def main():
+#     net, corridor = build_kundur_net_all4gens()
+#     print("Tie-line corridor line IDs:", corridor)
+
+#     ranking = compute_criticality_ranking(net, corridor)
+
+#     print("\n=== N-1 Generator Trip Results (All 4 including G3) ===")
+#     print(ranking[[
+#         "name", "CI", "cost_paper", "LS", "VV", "OL", "TF", "IN", "opf_ok", "vmin", "max_loading", "collapsed_proxy"
+#     ]].to_string(index=False))
+
+#     protected, target, metrics = malicious_trip_case_study(net, corridor, ranking, DEFENDER_PROTECT_TOP_K)
+#     protected_names = [net.gen.at[g, "name"] for g in sorted(list(protected))]
+
+#     print("\n=== Case Study II: Malicious Trip Command ===")
+#     print("Defender protected:", protected_names)
+#     print("Attacker tripped  :", net.gen.at[target, "name"])
+#     print("Outcome metrics  :", metrics)
+
+#     plot_results(ranking)
+#     plt.show()
+
+
+# if __name__ == "__main__":
+#     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# READY-TO-RUN (Single File)
+# Kundur Two-Area (RTDS tables) + Generator Criticality Ranking
+# + Case Study II: Malicious Generator Trip Command
+#
+# What you get:
+# 1) Builds Kundur two-area steady-state network (Tables: bus/lines/transformers/loads/shunts)
+# 2) Runs AC-OPF with load shedding enabled (controllable loads + VoLL)
+# 3) For each generator N-1 trip: computes metrics
+#      - OPF feasibility (opf_ok)
+#      - paper_cost = gen_cost + VoLL * load_shed  (IEEE-friendly)
+#      - LS (MW), VV, OL, TF (MW), IN (1/Hsys)
+#      - vmin, max_loading, collapsed_proxy
+# 4) Builds Criticality Index CI from normalized metrics (not MW-only)
+# 5) Case Study II:
+#      - Defender protects TOP-K critical generators
+#      - Attacker trips most critical unprotected generator
+#      - Reports metrics + plots
+#
+# Install:
+#   pip install pandapower numpy pandas matplotlib
+#
+# Run:
+#   python kundur_trip_case_study.py
+# ============================================================
+
+import copy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pandapower as pp
+
+
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+SBASE = 100.0     # MVA base for per-unit line tables
+VN_KV = 230.0     # single voltage level assumption for steady-state
+F_HZ = 50.0
+
+VoLL = 1000.0     # €/MW for load shedding penalty in "paper_cost"
+DEFENDER_PROTECT_TOP_K = 1  # protect top-k critical generators
+
+# Criticality weights (not MW-only)
+W = {"LS": 1.0, "VV": 0.8, "OL": 0.8, "TF": 0.8, "IN": 0.6}
+
+# Penalty used if OPF fails (to keep CI defined)
+BIG_PEN = 1e6
+
+# Voltage collapse proxy threshold (reporting only)
+VMIN_COLLAPSE = 0.75
+
+# Generation marginal cost (€/MW) used in paper_cost (keep consistent with poly_cost cp1)
+GEN_CP1 = 30.0
+
+
+# -----------------------------
+# Helpers: per-unit conversions
+# -----------------------------
+def pu_to_ohm(pu, vn_kv=VN_KV, sbase_mva=SBASE):
+    """Convert per-unit impedance (on system base) to ohms."""
+    zbase_ohm = (vn_kv ** 2) / sbase_mva
+    return pu * zbase_ohm
+
+
+def b_pu_to_c_nf_per_km(b_pu, vn_kv=VN_KV, sbase_mva=SBASE, f_hz=F_HZ, length_km=1.0):
+    """
+    Convert total shunt susceptance B_total (p.u. on system base) to c_nf_per_km for pandapower.
+    B_pu -> B_SI (S) using Zbase, then C = B/(2*pi*f).
+    """
+    zbase = (vn_kv ** 2) / sbase_mva
+    b_si = b_pu / zbase
+    c_total = b_si / (2 * np.pi * f_hz)       # Farads (total for the line)
+    return (c_total / length_km) * 1e9        # nF per km
+
+
+# -----------------------------
+# 1) Build Kundur Two-Area network (OPF-safe)
+# -----------------------------
+def build_kundur_net():
+    """
+    Data used corresponds to the classic Kundur two-area steady-state tables:
+      - Loads at bus 7 and 9
+      - Shunt caps at bus 7 and 9
+      - Transformers: 1-5, 2-6, 3-11, 4-10 (X=0.15 pu on 900 MVA base)
+      - Lines: 5-6, 6-7, 7-8 (double), 8-9 (double), 9-10, 10-11
+    """
+    net = pp.create_empty_network(sn_mva=SBASE, f_hz=F_HZ)
+
+    # Create buses 1..11
+    bus = {}
+    for b in range(1, 12):
+        bus[b] = pp.create_bus(net, vn_kv=VN_KV, name=f"Bus {b}")
+
+    net.bus["min_vm_pu"] = 0.90
+    net.bus["max_vm_pu"] = 1.10
+
+    # Transformers: X=0.15 pu on 900 MVA base -> convert to 100 MVA
+    x_tr_100 = 0.15 * (SBASE / 900.0)  # 0.0166667 pu
+    r_tr_100 = 0.0
+    z_tr = np.sqrt(r_tr_100**2 + x_tr_100**2)
+    vk_percent = z_tr * 100.0
+    vkr_percent = r_tr_100 * 100.0
+
+    for (hv, lv) in [(1, 5), (2, 6), (3, 11), (4, 10)]:
+        pp.create_transformer_from_parameters(
+            net,
+            hv_bus=bus[hv],
+            lv_bus=bus[lv],
+            sn_mva=900.0,
+            vn_hv_kv=VN_KV,
+            vn_lv_kv=VN_KV,
+            vk_percent=vk_percent,
+            vkr_percent=vkr_percent,
+            pfe_kw=0.0,
+            i0_percent=0.0,
+            shift_degree=0.0,
+            name=f"TR {hv}-{lv}",
+        )
+
+    # Lines: (from, to, Rpu, Xpu, Bpu_total, parallel)
+    line_specs = [
+        (5, 6, 0.0025, 0.025, 0.04375, 1),
+        (6, 7, 0.0010, 0.010, 0.01750, 1),
+        (7, 8, 0.0110, 0.110, 0.19250, 2),  # double circuit
+        (8, 9, 0.0110, 0.110, 0.19250, 2),  # double circuit
+        (9, 10, 0.0010, 0.010, 0.01750, 1),
+        (10, 11, 0.0025, 0.025, 0.04375, 1),
+    ]
+
+    corridor_line_ids = []
+    for (fb, tb, rpu, xpu, bpu, npar) in line_specs:
+        for k in range(npar):
+            r_ohm = pu_to_ohm(rpu)
+            x_ohm = pu_to_ohm(xpu)
+            c_nf_per_km = b_pu_to_c_nf_per_km(bpu)
+
+            lid = pp.create_line_from_parameters(
+                net,
+                from_bus=bus[fb],
+                to_bus=bus[tb],
+                length_km=1.0,
+                r_ohm_per_km=r_ohm,
+                x_ohm_per_km=x_ohm,
+                c_nf_per_km=c_nf_per_km,
+                max_i_ka=3.0,  # relaxed a bit to reduce infeasibility
+                name=f"Line {fb}-{tb} #{k+1}",
+            )
+
+            # corridor: 7-8 and 8-9 (both circuits)
+            if (fb, tb) in [(7, 8), (8, 9)]:
+                corridor_line_ids.append(lid)
+
+    # Loads
+    pp.create_load(net, bus=bus[7], p_mw=967.0, q_mvar=100.0, name="Load7")
+    pp.create_load(net, bus=bus[9], p_mw=1767.0, q_mvar=100.0, name="Load9")
+
+    # Shunt compensation (capacitive injection => negative q_mvar)
+    pp.create_shunt(net, bus=bus[7], p_mw=0.0, q_mvar=-200.0, name="QSH7")
+    pp.create_shunt(net, bus=bus[9], p_mw=0.0, q_mvar=-350.0, name="QSH9")
+
+    # One slack ext_grid at bus 3 ("G3")
+    eg = pp.create_ext_grid(net, bus=bus[3], vm_pu=1.03, name="Slack_G3", in_service=True)
+    net.ext_grid.loc[eg, "controllable"] = True
+    net.ext_grid.loc[eg, ["min_p_mw", "max_p_mw", "min_q_mvar", "max_q_mvar"]] = [0.0, 3000.0, -1500.0, 1500.0]
+
+    # Other generators as controllable gens at buses 1,2,4
+    for (b, name, vm, p0) in [(1, "G1", 1.03, 700.0), (2, "G2", 1.01, 700.0), (4, "G4", 1.01, 700.0)]:
+        gid = pp.create_gen(net, bus=bus[b], p_mw=p0, vm_pu=vm, name=name, controllable=True)
+        net.gen.loc[gid, ["min_p_mw", "max_p_mw", "min_q_mvar", "max_q_mvar"]] = [0.0, 2000.0, -1500.0, 1500.0]
+
+    # Costs (linear) for slack + gens
+    if len(net.poly_cost) == 0:
+        pp.create_poly_cost(net, element=eg, et="ext_grid", cp1_eur_per_mw=GEN_CP1)
+        for gid in net.gen.index:
+            pp.create_poly_cost(net, element=gid, et="gen", cp1_eur_per_mw=GEN_CP1)
+
+    # Add max_loading_percent column for overload metric
+    if "max_loading_percent" not in net.line.columns:
+        net.line["max_loading_percent"] = 100.0
+    net.line["max_loading_percent"] = net.line["max_loading_percent"].fillna(100.0)
+
+    return net, corridor_line_ids
+
+
+# -----------------------------
+# 2) Load shedding in OPF (controllable loads + negative "benefit")
+# -----------------------------
+def enable_load_shedding_opf(net, voll=VoLL):
+    """
+    Make loads controllable with bounds 0..P_nom.
+    Add negative cost -VoLL*P_served so OPF tries to serve load.
+    """
+    if "p_nom_mw" not in net.load.columns:
+        net.load["p_nom_mw"] = net.load["p_mw"].values
+    if "q_nom_mvar" not in net.load.columns:
+        net.load["q_nom_mvar"] = net.load["q_mvar"].values
+
+    net.load["controllable"] = True
+    net.load["min_p_mw"] = 0.0
+    net.load["max_p_mw"] = net.load["p_nom_mw"].values
+
+    # Keep Q bounded similarly (simple)
+    net.load["min_q_mvar"] = 0.0
+    net.load["max_q_mvar"] = net.load["q_nom_mvar"].values
+
+    existing = set()
+    if len(net.poly_cost):
+        existing = set(net.poly_cost.loc[net.poly_cost["et"] == "load", "element"].values)
+    for ld in net.load.index:
+        if ld not in existing:
+            pp.create_poly_cost(net, element=ld, et="load", cp1_eur_per_mw=-voll)
+
+
+# -----------------------------
+# 3) Inertia proxy (H values)
+# -----------------------------
+def get_inertia_data(net):
+    """
+    Inertia constants (seconds). Typical Kundur:
+      G1, G2: 6.5
+      G3, G4: 6.175
+    Here Slack_G3 corresponds to G3.
+    """
+    S_rated = 900.0  # MVA rating proxy
+    H = {}
+    S = {}
+
+    for gid in net.gen.index:
+        nm = net.gen.at[gid, "name"]
+        H[("gen", gid)] = 6.5 if nm in ["G1", "G2"] else 6.175
+        S[("gen", gid)] = S_rated
+
+    for eg in net.ext_grid.index:
+        H[("ext", eg)] = 6.175
+        S[("ext", eg)] = S_rated
+
+    return H, S
+
+
+def system_inertia(H, S, online_units):
+    denom = sum(S[u] for u in online_units) + 1e-12
+    num = sum(H[u] * S[u] for u in online_units)
+    return num / denom
+
+
+# -----------------------------
+# 4) Paper-friendly cost
+# -----------------------------
+def compute_paper_cost(net, voll=VoLL):
+    """
+    Paper cost = generation cost + VoLL * load_shed
+    Generation cost is linear with GEN_CP1 €/MW on (gens + slack).
+    """
+    # Total served and nominal load
+    p_nom = float(net.load["p_nom_mw"].sum()) if len(net.load) else 0.0
+    p_serv = float(net.res_load["p_mw"].sum()) if len(net.load) else 0.0
+    shed = max(0.0, p_nom - p_serv)
+
+    # Gen MW outputs
+    gen_cost = 0.0
+    if len(net.gen):
+        gen_cost += float((net.res_gen["p_mw"].clip(lower=0.0)).sum()) * GEN_CP1
+    if len(net.ext_grid):
+        gen_cost += float((net.res_ext_grid["p_mw"].clip(lower=0.0)).sum()) * GEN_CP1
+
+    return gen_cost + voll * shed, shed
+
+
+# -----------------------------
+# 5) OPF + metrics
+# -----------------------------
+def run_opf_and_metrics(net, corridor_line_ids):
+    """
+    Returns metrics for ranking and reporting.
+    If OPF fails: returns BIG penalties (no NaNs).
+    """
+    try:
+        pp.runopp(net, calculate_voltage_angles=True, suppress_warnings=True)
+        ok = True
+    except Exception:
+        return {
+            "opf_ok": False,
+            "cost_paper": BIG_PEN,
+            "LS": BIG_PEN,
+            "VV": BIG_PEN,
+            "OL": BIG_PEN,
+            "TF": BIG_PEN,
+            "vmin": 0.0,
+            "max_loading": BIG_PEN,
+            "collapsed_proxy": True,
+        }
+
+    cost_paper, shed = compute_paper_cost(net, VoLL)
+
+    # Voltage violations
+    v = net.res_bus["vm_pu"].values
+    vmin = float(np.min(v))
+    vlims_min = net.bus["min_vm_pu"].values
+    vlims_max = net.bus["max_vm_pu"].values
+    VV = float(np.maximum(0.0, vlims_min - v).sum() + np.maximum(0.0, v - vlims_max).sum())
+
+    # Overloads
+    loading = net.res_line["loading_percent"].values if len(net.line) else np.array([0.0])
+    max_loading = float(np.max(loading)) if len(loading) else 0.0
+    lim = net.line["max_loading_percent"].values
+    OL = float(np.maximum(0.0, loading - lim).sum()) if len(net.line) else 0.0
+
+    # Tie-line stress: sum |p_from_mw| on corridor lines
+    TF = float(net.res_line.loc[corridor_line_ids, "p_from_mw"].abs().sum()) if corridor_line_ids else 0.0
+
+    collapsed_proxy = (vmin < VMIN_COLLAPSE)
+
+    return {
+        "opf_ok": ok,
+        "cost_paper": float(cost_paper),
+        "LS": float(shed),
+        "VV": float(VV),
+        "OL": float(OL),
+        "TF": float(TF),
+        "vmin": vmin,
+        "max_loading": max_loading,
+        "collapsed_proxy": collapsed_proxy,
+    }
+
+
+# -----------------------------
+# 6) Trip logic + Criticality ranking
+# -----------------------------
+def trip_gen(net, gid):
+    net.gen.at[gid, "in_service"] = False
+
+
+def compute_criticality_ranking(net_base, corridor_line_ids):
+    """
+    N-1 screening over each controllable generator in net.gen:
+      trip gid -> OPF -> metrics
+      compute inertia proxy IN = 1/Hsys(-gid)
+      normalize metrics -> CI
+    """
+    H, S = get_inertia_data(net_base)
+
+    # Online units for inertia (gens + slack)
+    all_units = []
+    for gid in net_base.gen.index:
+        if bool(net_base.gen.at[gid, "in_service"]):
+            all_units.append(("gen", gid))
+    for eg in net_base.ext_grid.index:
+        if bool(net_base.ext_grid.at[eg, "in_service"]):
+            all_units.append(("ext", eg))
+
+    Hsys_base = system_inertia(H, S, all_units)
+
+    rows = []
+    for gid in net_base.gen.index:
+        net = copy.deepcopy(net_base)
+        enable_load_shedding_opf(net, VoLL)
+
+        if bool(net.gen.at[gid, "in_service"]):
+            trip_gen(net, gid)
+
+        m = run_opf_and_metrics(net, corridor_line_ids)
+
+        # inertia after losing gid
+        online_minus = [u for u in all_units if not (u[0] == "gen" and u[1] == gid)]
+        Hsys_minus = system_inertia(H, S, online_minus)
+        IN = float(1.0 / (Hsys_minus + 1e-12))  # higher => worse
+
+        rows.append({
+            "gen_id": gid,
+            "name": net_base.gen.at[gid, "name"],
+            "cost_paper": m["cost_paper"],
+            "LS": m["LS"],
+            "VV": m["VV"],
+            "OL": m["OL"],
+            "TF": m["TF"],
+            "IN": IN,
+            "opf_ok": m["opf_ok"],
+            "vmin": m["vmin"],
+            "max_loading": m["max_loading"],
+            "collapsed_proxy": m["collapsed_proxy"],
+            "Hsys_base": Hsys_base,
+            "Hsys_minus": Hsys_minus,
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Normalize metrics to [0,1]
+    eps = 1e-9
+    for col in ["LS", "VV", "OL", "TF", "IN"]:
+        x = df[col].astype(float).values
+        xmin, xmax = float(np.min(x)), float(np.max(x))
+        df[f"n_{col}"] = (df[col] - xmin) / (xmax - xmin + eps)
+
+    # Criticality Index
+    df["CI"] = (
+        W["LS"] * df["n_LS"] +
+        W["VV"] * df["n_VV"] +
+        W["OL"] * df["n_OL"] +
+        W["TF"] * df["n_TF"] +
+        W["IN"] * df["n_IN"]
+    )
+
+    df = df.sort_values("CI", ascending=False).reset_index(drop=True)
+    return df
+
+
+# -----------------------------
+# 7) Case Study II: Defender protects top-k, attacker trips best unprotected
+# -----------------------------
+def malicious_trip_case_study(net_base, corridor_line_ids, ranking_df, protect_top_k=1):
+    ordered = ranking_df["gen_id"].tolist()
+    protected = set(ordered[:protect_top_k])
+
+    target = None
+    for gid in ordered:
+        if gid not in protected:
+            target = gid
+            break
+    if target is None:
+        raise RuntimeError("All generators protected; no target left.")
+
+    net_attack = copy.deepcopy(net_base)
+    enable_load_shedding_opf(net_attack, VoLL)
+    trip_gen(net_attack, target)
+    metrics = run_opf_and_metrics(net_attack, corridor_line_ids)
+
+    return protected, target, metrics
+
+
+# -----------------------------
+# 8) Plots
+# -----------------------------
+def plot_results(ranking_df):
+    # CI bar plot
+    plt.figure()
+    plt.bar(ranking_df["name"], ranking_df["CI"])
+    plt.xlabel("Generator (tripped in N-1)")
+    plt.ylabel("Criticality Index (CI)")
+    plt.title("Generator Criticality Ranking (Multi-metric)")
+    plt.grid(True, axis="y")
+
+    # Cost bar plot
+    plt.figure()
+    plt.bar(ranking_df["name"], ranking_df["cost_paper"])
+    plt.xlabel("Generator (tripped in N-1)")
+    plt.ylabel("OPF Paper Cost = GenCost + VoLL·Shed")
+    plt.title("OPF Cost Under N-1 Generator Trip")
+    plt.grid(True, axis="y")
+
+    # Metric breakdown line plot
+    plt.figure()
+    x = np.arange(len(ranking_df))
+    plt.plot(x, ranking_df["LS"], marker="o", label="LS (MW)")
+    plt.plot(x, ranking_df["VV"], marker="o", label="VV")
+    plt.plot(x, ranking_df["OL"], marker="o", label="OL")
+    plt.plot(x, ranking_df["TF"], marker="o", label="TF (MW)")
+    plt.plot(x, ranking_df["IN"], marker="o", label="IN (1/H)")
+    plt.xticks(x, ranking_df["name"])
+    plt.xlabel("Generator (sorted by CI)")
+    plt.title("Impact Metrics Under N-1 Trip (Sorted by CI)")
+    plt.grid(True)
+    plt.legend()
+
+def plot_ci_and_cost(ranking_df):
+    df = ranking_df.copy()
+
+    x = np.arange(len(df))
+    width = 0.35
+
+    # normalize cost so both can be shown on same figure
+    cost_norm = df["cost_paper"] / df["cost_paper"].max()
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x - width/2, df["CI"], width, label="Criticality Index (CI)")
+    plt.bar(x + width/2, cost_norm, width, label="Normalized Cost")
+
+    plt.xticks(x, df["name"])
+    plt.xlabel("Generator")
+    plt.ylabel("Normalized value")
+    plt.title("Comparison of Criticality Index and Economic Cost")
+    plt.grid(True, axis="y")
+    plt.legend()
+    plt.tight_layout()
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    net, corridor = build_kundur_net()
+    print("Tie-line corridor line IDs:", corridor)
+
+    # Criticality ranking
+    ranking = compute_criticality_ranking(net, corridor)
+
+    print("\n=== Generator Criticality Ranking (highest CI first) ===")
+    print(
+        ranking[
+            ["name", "CI", "cost_paper", "LS", "VV", "OL", "TF", "IN", "opf_ok", "vmin", "max_loading", "collapsed_proxy"]
+        ].to_string(index=False)
+    )
+
+    # Case Study II: malicious trip
+    protected, target, metrics = malicious_trip_case_study(net, corridor, ranking, DEFENDER_PROTECT_TOP_K)
+    protected_names = [net.gen.at[g, "name"] for g in sorted(list(protected))]
+
+    print("\n=== Case Study II: Malicious Trip Command ===")
+    print("Defender protected:", protected_names)
+    print("Attacker tripped  :", net.gen.at[target, "name"])
+    print("Outcome metrics  :", metrics)
+
+    # Plots
+    plot_results(ranking)
+    plot_ci_and_cost(ranking)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
