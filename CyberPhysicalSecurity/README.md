@@ -65,13 +65,3 @@ Run scripts **individually**: they use different network assumptions, OPF setups
 3. Run a nominal reference and evaluate generator trip or manipulated-load scenarios.
 4. Calculate scenario-dependent cost, voltage, loading, tie-flow or dispatch-deviation metrics.
 5. Compare criticality and defender protection choices or generate sensitivity plots.
-
-## Important model notes
-
-- **Physical vs measurement attacks:** In the IEEE-14 script, attack actions directly change network loads; this is a physical-load perturbation model, **not** a state-estimator measurement-only FDI attack. The end-of-file DC SE section is commented out. The Kundur FDI scripts model falsified EMS load beliefs followed by a truth-model check; the interpretation differs from changing actual physical demand.
-- **Optimization:** The protection games enumerate particular attack levels, buses and/or corner points; they do **not** establish globally optimal continuous solutions unless separately verified.
-- **Network assumptions:** The Kundur representations are manually constructed, steady-state `pandapower` models with user-specified impedances, voltage levels, dispatch and generation limits. These are not full electromagnetic transient/RTDS dynamic models.
-- **Collapse and feasibility:** Minimum-voltage thresholds are proxies, not proof of voltage collapse. OPF/PF non-convergence can depend on numerical settings.
-- **Reliability:** The scripts' input assumptions, attack units, load-shedding cost conventions and truth-network dispatch treatment should be reviewed and the results cross-checked before publication.
-- **Formatting correction:** The supplied integrated Kundur file was exported as markdown with escaped characters and non-breaking spaces; its executable copy has these formatting artifacts removed. Its original file remains unchanged in `originals/`.
-
