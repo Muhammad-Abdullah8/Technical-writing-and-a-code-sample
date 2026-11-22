@@ -75,10 +75,3 @@ Run scripts **individually**: they use different network assumptions, OPF setups
 - **Reliability:** The scripts' input assumptions, attack units, load-shedding cost conventions and truth-network dispatch treatment should be reviewed and the results cross-checked before publication.
 - **Formatting correction:** The supplied integrated Kundur file was exported as markdown with escaped characters and non-breaking spaces; its executable copy has these formatting artifacts removed. Its original file remains unchanged in `originals/`.
 
-## Provenance and verification
-
-The `originals/` directory contains unchanged input files. The `scripts/` directory contains organized Python copies with a concise module-level description. All four scripts have been **syntax-checked**, but full AC-OPF simulation and output plots have **not** been run or numerically validated as part of packaging.
-
-## Citation and license
-
-Add the relevant publication/thesis citation and choose a license before public release. No license is implied by this repository package.
